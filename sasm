@@ -1,0 +1,683 @@
+#! /usr/bin/python3
+
+# -*- python -*-
+
+import sys
+import re
+
+class Obj:
+    """Class that handles Pass 2 and generates the obj file"""
+
+    def __init__(self, start, length, name, inst, labels, fd, insts, uz):
+        if len(name) > 6:
+            name = name[:6]
+        spaces = 6 - len(name)
+        for i in range(spaces):
+            name = name + " "
+        # set up some class wide variables
+        self._pc = int(start, 16)
+        self._t_start = int(start, 16)
+        self._uz = uz
+        self._base = False
+        self._length = 0
+        self._B = 0
+        #self._bytes = bytes = [i for i in range(256)]
+        self._len = int(length) - self._pc
+        self._inst_list = inst
+        self._inst_key = insts
+        self._labels = labels
+        self._buffer = []
+        self._inst_count = 0
+        self._file = fd
+        self._disp = 0
+        self._regs = {"A": "0", "X": "1", "L": "2", "B": "3", "S": "4",
+                      "T": "5", "F": "6", "PC": "8", "SW": "9"}
+        self.header_print(start, length, name) # prints the header
+        self.handle_file() # handles the rest of the file
+
+    def write_char_file(self, out): # this writes out chars, used for H, T, E and name
+        arr = bytearray([ord(out)])
+        self._file.write(arr)
+
+    def write_string_file(self, out): # helper function to write out strings
+        for chr in out:
+            self.write_char_file(chr)
+
+    def write_byte_file(self, out): # this writes out for any binary info
+        arr = bytearray([int(out, 16)])
+        self._file.write(arr)
+
+    def write_word_file(self, out): # helper function to right out words
+        for i in range(len(out) // 2):
+            self.write_byte_file(out[2 * i:2 * i + 2])
+
+    def header_print(self, start, length, name): # write the header to the file
+        start = hex_conv((self._pc))
+        length = hex_conv(self._len)
+        self.write_char_file("H")
+        self.write_string_file(name)
+        self.write_word_file(start)
+        self.write_word_file(length)
+
+    def handle_file(self): # handles T records and creates machine code for all non directive lines
+        for i in range(self._uz, len(self._inst_list)):
+            line = self._inst_list[i]
+            #print(line)
+            size = 0
+            # match the line to an instruction and variable or just inst for format 1
+            match_inst = re.match(r"^(?P<inst>[+A-Z]+)\s+(?P<var>[ -~]+)$", line, re.IGNORECASE)
+            if match_inst:
+                inst = match_inst.group("inst").upper()
+                var = match_inst.group("var").upper()
+
+            else:
+                match_nov = re.match(r"^(?P<inst>[+A-Z]+)", line, re.IGNORECASE)
+                inst = match_nov.group("inst").upper()
+                var = "0"
+
+            #print(var)
+
+            # check that the buffer isn't too full
+            self.check_buffer(inst, var)
+
+            # check for extended case
+            if inst[0] == "+":
+                size += 1
+                inst = inst[1:]
+            size += self._inst_key[inst].get_format()
+            opcode = self._inst_key[inst].get_opcode()
+
+            # check the directives and tricky insts
+            if inst == "END":
+                self.end_file(var)
+                break
+
+            elif inst == "RESB" or inst == "RESW":
+                self._t_start += int(var) * size
+                self._pc += int(var) * size
+
+            elif inst == "BASE":
+                self._base = True
+                self._B = int(var)
+                for key in self._labels:
+                    if key == var:
+                        self._B = self._labels[var][0]
+
+            elif inst == "NOBASE":
+                self._base = False
+
+            elif inst == "BYTE":
+                if var[0] == "X":
+                    hex = var[2:len(var) - 1]
+                    size = len(hex) // 2 + len(hex) % 2
+                    if size != len(hex) // 2:
+                        hex = "0" + hex
+                    self._buffer += [[hex, "w"]]
+
+                elif var[0] == "C":
+                    size = len(var[2:len(var) - 1])
+                    self._buffer += [[var[2:len(var) - 1], "s"]]
+                else:
+                    size = 1
+                    self._buffer += [[self.fhex_conv(int(var), 2), "b"]]
+                self._pc += size
+                self._length += size
+
+            elif inst == "WORD":
+                size = 3
+                self._pc += size
+                self._length += size
+                self._buffer += [[self.fhex_conv(int(var), 6), "w"]]
+
+            elif inst == "RSUB":
+                if match_inst:
+                    raise SystemExit("RSUB cannot have a variable attached")
+                size = 3
+                self._pc += size
+                self._length += size
+                self._buffer += [["4F0000", "w"]]
+
+            elif inst == "SVC":
+                match_num = re.match(r"^(?P<reg1>[0-9]+)", var, re.IGNORECASE)
+                var = self.fhex_conv(int(match_num.group("reg1")), 1)
+                self._pc += size
+                self._length += size
+                self._buffer += [[opcode + var + "0", "w"]]
+
+            # if it is not a directive it is an instruction
+            else:
+                self._pc += size
+                self._length += size
+
+                # PRIORITIES: extended, based, pc-relative, direct, and SIC (Basic)
+
+                # check size 1
+                if size == 1:
+
+                    self._buffer += [[opcode, "b"]]
+
+                # check size 2
+                if size == 2:
+
+                    # size 2 has a few forms for different instructions, match the proper one
+                    match_regs = re.match(r"^(?P<reg1>[AXLBSTFPCSW]+)\s*,\s*(?P<reg2>[AXLBSTFPCSW0-9]+)", var, re.IGNORECASE)
+                    match_one = re.match(r"^(?P<reg1>[AXLBSTFPCSW]+)", var, re.IGNORECASE)
+                    if match_regs:
+                        # TIXR can't have more than 1 variable
+                        if inst == "TIXR":
+                            raise SystemExit("TIXR error")
+                        reg1 = self._regs[match_regs.group("reg1")]
+                        reg2 = match_regs.group("reg2")
+                        regis = False
+                        for key in self._regs:
+                            if key == match_regs.group("reg2"):
+                                reg2 = self._regs[match_regs.group("reg2")]
+                                regis = True
+                        if regis == False:
+                            reg2 = self.fhex_conv(int(reg2) - 1, 1)
+
+                    # if it is only one reg reg2 defaults to 0
+                    elif match_one:
+                        reg1 = self._regs[match_one.group("reg1")]
+                        reg2 = "0"
+
+                    self._buffer += [[opcode + reg1 + reg2, "w"]]
+
+                # check size 3
+                if size == 3:
+
+                    xbpe = 0
+                    sic = False
+                    immediate = False
+                    indirect = False
+                    ni_check = var[0]
+                    # check the n and i bits
+                    if ni_check == "#":
+                        immediate = True
+                        var = var[1:]
+                        var_string = var
+                        ni = 1
+                        for key in self._labels:
+                            if key == var:
+                                var = hex_conv(self._labels[key][0])
+
+                    elif ni_check == "@":
+                        indirect = True
+                        var = var[1:]
+                        var_string = var
+                        ni = 2
+                        for key in self._labels:
+                            if key == var:
+                                var = hex_conv(self._labels[key][0])
+
+                    else:
+                        var_string = var
+                        ni = 3
+                        for key in self._labels:
+                            if key == var:
+                                var = hex_conv(self._labels[key][0])
+
+                    indexed = False
+                    x_check = re.match(r"^(?P<var>[ -~]+)\s*,\s*(?P<x>[x]+)", var_string, re.IGNORECASE)
+                    if x_check:
+                        var = x_check.group("var")
+                        indexed = True
+
+                    # can't be indexed with immediate or indirect
+                    if indexed and (immediate or indirect):
+                        raise SystemExit("Can't have indexed and immediate or indirect")
+
+                    # check each addressing mode in order of priority
+                    if self._base and self.b_check(var):
+                        xbpe += 4
+
+                    elif self.pc_check(var):
+                        xbpe += 2
+
+                    elif self.d_check(var):
+                        xbpe += 0
+
+                    elif self.s_check(var):
+                        sic = True
+
+                    # if none of these work than it needs to be extended
+                    else:
+                        raise SystemExit("Displacement too large for format 3 instruction")
+
+                    if sic == False:
+
+                        opni = self.fhex_conv(int(opcode, 16) + ni, 2)
+
+                        x_check = re.match(r"^(?P<var>[ -~]+)\s*,\s*(?P<x>[x]+)", var_string, re.IGNORECASE)
+                        if x_check:
+                            xbpe += 8
+                        xbpe = self.fhex_conv(xbpe, 1)
+
+                        self._buffer += [[opni + xbpe + self._disp, "w"]]
+
+                    else:
+                        x_check = re.match(r"^(?P<var>[ -~]+)\s*,\s*(?P<x>[x]+)", var_string, re.IGNORECASE)
+                        if x_check:
+                            top_bit = int(self._disp[0])
+                            top_bit += 8
+
+                            self._disp = self.fhex_conv(top_bit, 1) + self._disp[1:]
+
+                        self._buffer += [[opcode + self._disp, "w"]]
+
+                # check size 4
+                if size == 4:
+
+                    # b and p can't be set with e, just need to check x
+                    xbpe = 1
+                    x_check = re.match(r"^(?P<var>[ -~]+)\s*,\s*(?P<x>[x]+)", var, re.IGNORECASE)
+                    if x_check:
+                        xbpe += 8
+                        var = x_check.group("var")
+                    xbpe = self.fhex_conv(xbpe, 1)
+
+                    # check n and i bit
+                    ni_check = var[0]
+                    if ni_check == "#":
+                        var = var[1:]
+                        var_string = var
+                        ni = 1
+                        for key in self._labels:
+                            if key == var:
+                                var = self._labels[key][0]
+                        disp = self.fhex_conv(int(var), 5)
+
+                    elif ni_check == "@":
+                        var = var[1:]
+                        var_string = var
+                        ni = 2
+                        for key in self._labels:
+                            if key == var:
+                                var = self._labels[key][0]
+                        disp = self.fhex_conv(int(var), 5)
+
+                    else:
+                        var_string = var
+                        ni = 3
+                        for key in self._labels:
+                            if key == var:
+                                var = self._labels[key][0]
+                        disp = self.fhex_conv(int(var), 5)
+
+                    opni = self.fhex_conv(int(opcode, 16) + ni, 2)
+
+                    self._buffer += [[opni + xbpe + disp, "w"]]
+
+    # checks disp is in range for base
+    def b_check(self, var):
+        conv = False
+        for key in self._labels:
+            if key == var:
+                var = self._labels[key][0]
+                conv = True
+        if conv:
+            self._disp = var - self._B
+        else:
+            self._disp = int(var, 16) - self._B
+        if self._disp < 0 or self._disp > 2 ** 12:
+            return False
+        self._disp = self.fhex_conv(self._disp, 3)
+        return True
+
+    # checks disp is in range for pc relative
+    def pc_check(self, var):
+        conv = False
+        for key in self._labels:
+            if key == var:
+                var = self._labels[key][0]
+                conv = True
+        if conv:
+            self._disp = var - self._pc
+        else:
+            self._disp = int(var, 16) - self._pc
+        if self._disp < -(2 ** 11) or self._disp > (2 ** 11) - 1:
+            return False
+        self._disp = self.fhex_conv(self._disp, 3)
+        return True
+
+    # checks disp is in range for direct
+    def d_check(self, var):
+        for key in self._labels:
+            if key == var:
+                var = str(self._labels[key][0])
+        self._disp = int(var, 16)
+        if self._disp < 0 or self._disp > 2 ** 12:
+            return False
+        self._disp = self.fhex_conv(self._disp, 3)
+        return True
+
+    # checks disp is in range for SIC (basic)
+    def s_check(self, var):
+        conv = False
+        for key in self._labels:
+            if key == var:
+                var = str(self._labels[key][0])
+                conv = True
+        if conv:
+            self._disp = int(var)
+        else:
+            self._disp = int(var, 16)
+        if self._disp < 0 or self._disp > 2 ** 15:
+            return False
+        self._disp = self.fhex_conv(self._disp, 4)
+        return True
+
+    # takes a number and a length of displacement (in hex chars) and gives back the hex disp
+    def fhex_conv(self, num, length):
+        if num >= 0:
+            hex_num = hex(num).lstrip("0x")
+            neg = False
+        else:
+            hex_num = hex(num).lstrip("-0x")
+            neg = True
+        hex_num = hex_num.upper()
+        zeroes = length - len(hex_num)
+        for i in range(zeroes):
+            hex_num = "0" + hex_num
+        if neg:
+            f_chain = ""
+            for i in range(len(hex_num)):
+                f_chain += "f"
+            neg_int = int(f_chain, 16) - int(hex_num, 16) + 1
+            hex_num = self.fhex_conv(neg_int, length)
+        return hex_num
+
+    # check if the buffer is full, if it is print a T record
+    def check_buffer(self, inst, var):
+        if self._length >= 64 or inst[:3] == "RES" or inst == "END":
+            if self._buffer != []:
+                #print(self._buffer)
+                self.write_char_file("T")
+                self.write_word_file(hex_conv(self._t_start))
+                print_length = self._length
+                if self._length > 64:
+                    print_length = 64
+                self._t_start += print_length
+                self.write_byte_file(hex(print_length).lstrip("0x"))
+                new_buf = []
+                leng = 0
+                for i in range(len(self._buffer)):
+                    if leng >= 64:
+                        new_buf += [self._buffer[i]]
+                    else:
+                        # this activates when a buffer is over 64 in length
+                        proj_len = leng
+                        proj_len += len(self._buffer[i][0]) // 2
+                        if proj_len >= 64:
+                            can_fit = 64 - leng
+                            split = self._buffer[i][0][:2 * can_fit]
+                            self.write_word_file(split)
+                            back = self._buffer[i][0][2 * can_fit:]
+                            new_buf += [[back, self._buffer[i][1]]]
+
+                        else:
+                            # normal write outs for under 64 in length
+                            if self._buffer[i][1] == "w":
+                                self.write_word_file(self._buffer[i][0])
+                            if self._buffer[i][1] == "b":
+                                self.write_byte_file(self._buffer[i][0])
+                            if self._buffer[i][1] == "s":
+                                self.write_string_file(self._buffer[i][0])
+
+                        leng += len(self._buffer[i][0]) // 2
+
+                self._buffer = new_buf
+                self._length = proj_len - 64
+
+    # handles the end of file record
+    def end_file(self, ep):
+        self.write_char_file("E")
+        for key in self._labels:
+            if key == ep:
+                ep = self._labels[ep][0]
+        if ep == 0 or ep == "0":
+            self.write_word_file("000000")
+        else:
+            self.write_word_file(self.fhex_conv(ep, 6))
+
+
+class Inst:
+
+    def __init__(self, format, opcode):
+        self.format = format
+        self.opcode = opcode
+
+    def get_format(self):
+        return self.format
+
+    def get_opcode(self):
+        return self.opcode
+
+
+def start():
+    if (len(sys.argv) < 2):
+        raise SystemExit("Usage: asm <filename>")
+
+    filename = sys.argv[1]
+    try:
+        inFd = open(filename, "r")
+    except IOError:
+        raise SystemExit("Error opening input file: " + filename)
+
+    insts = {"ADD" : Inst(3, "18"), "ADDF" : Inst(3, "58"), "ADDR" : Inst(2, "90"),
+             "AND" : Inst(3, "40"), "CLEAR" : Inst(2, "b4"), "COMP" : Inst(3, "28"),
+             "COMPF" : Inst(3, "88"), "COMPR" : Inst(2, "a0"), "DIV" : Inst(3, "24"),
+             "DIVF" : Inst(3, "64"), "DIVR" : Inst(2, "9c"), "FIX" : Inst(1, "c4"),
+             "FLOAT" : Inst(1, "c0"), "HIO" : Inst(1, "f4"), "J" : Inst(3, "3c"),
+             "JEQ" : Inst(3, "30"), "JGT" : Inst(3, "34"), "JLT" : Inst(3, "38"),
+             "JSUB" : Inst(3, "48"), "LDA" : Inst(3, "00"), "LDB" : Inst(3, "68"),
+             "LDCH" : Inst(3, "50"), "LDF" : Inst(3, "70"), "LDL" : Inst(3, "08"),
+             "LDS" : Inst(3, "6c"), "LDT" : Inst(3, "74"), "LDX" : Inst(3, "04"),
+             "LPS" : Inst(3, "d0"), "MUL" : Inst(3, "20"), "MULF" : Inst(3, "60"),
+             "MULR" : Inst(2, "98"), "NORM" : Inst(1, "c8"), "OR" : Inst(3, "44"),
+             "RD" : Inst(3, "d8"), "RMO" : Inst(2, "ac"), "RSUB" : Inst(3, "4c"),
+             "SHIFTL" : Inst(2, "a4"), "SHIFTR" : Inst(2, "a8"), "SIO" : Inst(1, "f0"),
+             "SSK" : Inst(3, "ec"), "STA" : Inst(3, "0c"), "STB" : Inst(3, "78"),
+             "STCH" : Inst(3, "54"), "STF" : Inst(3, "80"), "STI" : Inst(3, "d4"),
+             "STL" : Inst(3, "14"), "STS" : Inst(3, "7c"), "STSW" : Inst(3, "e8"),
+             "STT" : Inst(3, "84"), "STX" : Inst(3, "10"), "SUB" : Inst(3, "1c"),
+             "SUBF" : Inst(3, "5c"), "SUBR" : Inst(2, "94"), "SVC" : Inst(2, "b0"),
+             "TD" : Inst(3, "e0"), "TIO" : Inst(1, "f8"), "TIX" : Inst(3, "2c"),
+             "TIXR" : Inst(2, "b8"), "WD" : Inst(3, "dc"), "START" : Inst(0, "none"),
+             "END" : Inst(0, "none"), "BYTE" : Inst(1, "none"), "BASE" : Inst(0, "none"),
+             "RESW" : Inst(3, "none"), "RESB" : Inst(1, "none"), "WORD" : Inst(3, "none"),
+             "NOBASE" : Inst(0, "none")}
+
+    labels, inst, length = pass1(inFd, insts) # labels is a returned list of lists that have the labels and their locations
+
+    alphabetize(labels)
+
+    #print("Symbols:")
+    #for ele in labels:
+    #    print("  {}: {}".format(ele[0], hex_conv(ele[1])))
+
+    #for ele in inst:
+    #    print(ele)
+
+    labels = change_labels(labels) # turn labels into a dictionary for pass2
+    if (len(sys.argv) == 3): # check if there is a given obj file
+        fd = open(sys.argv[2], "wb") # open in in binary mode
+
+    else:
+        fileopen = sys.argv[1][:len(sys.argv[1]) - 3] + "obj" # if no obj file given create on or overwrite one of the same name
+        fd = open(fileopen, "wb")
+
+    pass2(labels, inst, insts, length, fd) # Sets up class for writing to the file
+
+    return 0
+
+def change_labels(labels):
+    new_l = {}
+    for ele in labels:
+        new_l[ele[0]] = [ele[1], ele[2]]
+    return new_l
+
+def hex_conv(num):
+    hex_num = hex(num).lstrip("0x")
+    hex_num = hex_num.upper()
+    zeroes = 6 - len(hex_num)
+    for i in range(zeroes):
+        hex_num = "0" + hex_num
+    return hex_num
+
+def alphabetize(list):
+    for i in range(len(list)):
+        for j in range(len(list) - 1):
+            if list[j][0] > list[j + 1][0]:
+                temp = list[j]
+                list[j] = list[j + 1]
+                list[j + 1] = temp
+
+def pass2(labels, inst, insts, len, fd):
+    first = inst[0]
+    start_loc = "0"
+    start_mat = re.match(r"^START\s+(?P<slen>[0-9]+)", first, re.IGNORECASE)
+    use_zero = 0
+    if start_mat:
+        start_loc = start_mat.group("slen")
+        use_zero = 1
+    name = ""
+    for key in labels:
+        if labels[key][1] == True:
+            name = key
+    obj_file = Obj(start_loc, len, name, inst, labels, fd, insts, use_zero)
+
+def pass1(inFd, insts):
+
+    length = 0
+    labels = []
+    instructions = []
+    line_num = 0
+    line = inFd.readline()
+    while line != "":
+        line_num += 1
+        line = detabify(line)
+        pot_label, size, string, set_start =  parseInstruction(line, insts, line_num) # this returns a potential label and the size of the mnemonic called
+        if pot_label != "": # if the label was returned as the empty string then there is no label
+            if set_start:
+                labels += [[pot_label, size, True]]
+                length -= size
+            else:
+                if check_label(labels, pot_label):
+                    raise SystemExit("ERROR: Label defined a second time on line {}".format(line_num))
+                labels += [[pot_label, length, False]]
+        length += size # length is updated for the next space label is at the length after the last call
+        if string != "":
+            instructions += [string]
+        line = inFd.readline()
+    return labels, instructions, length
+
+def check_label(labels, pot_label):
+    for ele in labels:
+        if ele[0] == pot_label:
+            return True
+    return False
+
+def detabify(line):
+    k = 0
+    for i in range(len(line)):
+        if line[k] == '\t':
+            line = line[:k] + " " + line[k + 1:]
+            start = k % 8
+            for j in range(start, 9):
+                line = line[:k] + " " + line[k:]
+            k += 8 - start
+        k += 1
+    return line[:40]
+
+
+def parseInstruction(line, insts, line_num):
+    line = line.strip()
+
+    match = re.match(r"^(?P<name>[A-Z_][A-Z_0-9]*)\s*:\s*\+*(?P<mnemonic>[A-Z]+)\s*(?P<var1>[ -~]*)", line, re.IGNORECASE) # normal match
+    match_four = re.match(r"^(?P<name>[A-Z_][A-Z_0-9]*)\s*:\s*\+(?P<mnemonic>[A-Z]+)", line, re.IGNORECASE) # match checking for extended bit call
+    match_labelless = re.match(r"^\+*(?P<mnemonic>[A-Z]+)\s*(?P<var1>[ -~]*)", line, re.IGNORECASE) # match for non labelled lines
+    match_four_labelless = re.match(r"^\+(?P<mnemonic>[A-Z]+)", line, re.IGNORECASE) # match checking for extended bit callwoth no label
+    match_comment = re.match(r"^.", line, re.IGNORECASE) # match checking for extended bit call
+
+    if match:
+
+        try:
+            size = insts[match.group("mnemonic").upper()].get_format()
+        except:
+            raise SystemExit("ERROR: Instruction doesn't exist on line {}".format(line_num))
+
+        set_start = False
+
+        if match.group("mnemonic").upper() == "START": # check if it is start
+            size = int(match.group("var1"), 16)
+            if size > int("FFFFE", 16):
+                raise SystemExit("Error: Start size too big")
+            set_start = True
+
+        if match.group("mnemonic").upper() == "END": # check if it is end
+            size = 0
+
+        if match.group("mnemonic").upper() == "RESB": # check for reserve byte
+            size = int(match.group("var1"))
+
+        if match.group("mnemonic").upper() == "RESW": # check for reserve word
+            size = 3*int(match.group("var1"))
+
+        if match.group("mnemonic").upper() == "BYTE": # bytes work different with X' and C'
+            if match.group("var1").upper()[0] == "C":
+                size = len(match.group("var1")[2:len(match.group("var1")) - 1])
+            elif match.group("var1").upper()[0] == "X":
+                size = len(match.group("var1")[2:len(match.group("var1")) - 1]) // 2 + len(match.group("var1")[2:len(match.group("var1")) - 1]) % 2
+            else:
+                size = 1
+
+        if match_four:
+            size += 1
+
+        return match.group("name").upper(), size, line[len(match.group("name")) + 1:].strip(), set_start
+
+    if match_labelless: # still need to increment the length even when there is no label
+
+        try:
+            size = insts[match_labelless.group("mnemonic").upper()].get_format()
+        except:
+            raise SystemExit("ERROR: Instruction doesn't exist on line {}".format(line_num))
+
+        set_start = False
+
+        if match_labelless.group("mnemonic").upper() == "START": # check start
+            size = int(match_labelless.group("var1"), 16)
+            if size > int("FFFFE", 16):
+                raise SystemExit("Error: Start size too big")
+            set_start = True
+
+        if match_labelless.group("mnemonic").upper() == "END": # check end
+            size = 0
+
+        if match_labelless.group("mnemonic").upper() == "RESB": # check for reserve byte
+            size = int(match_labelless.group("var1"))
+
+        if match_labelless.group("mnemonic").upper() == "RESW": # check for reserve word
+            size = 3*int(match_labelless.group("var1"))
+
+        if match_labelless.group("mnemonic").upper() == "BYTE": # bytes work different with X' and C'
+            if match_labelless.group("var1").upper()[0] == "C":
+                size = len(match_labelless.group("var1")[2:len(match_labelless.group("var1")) - 1])
+            elif match_labelless.group("var1").upper()[0] == "X":
+                size = len(match_labelless.group("var1")[2:len(match_labelless.group("var1")) - 1]) // 2 + len(match_labelless.group("var1")[2:len(match_labelless.group("var1")) - 1]) % 2
+            else:
+                size = 1
+
+        if match_four_labelless:
+            size += 1
+
+        return "", size, line, set_start
+
+    if match_comment:
+        return "", 0, "", False
+
+    return "", 0, "", False
+
+if __name__ == "__main__":
+    start()
